@@ -1,0 +1,163 @@
+# Archivo: 02_model_analysis.R
+# Propósito: ORQUESTACIÓN DE DATOS (SQL en memoria con RSQLite), EDA, visualización y modelado predictivo (Random Forest).
+
+# --- 1. CONFIGURACIÓN E INSTALACIÓN DE PAQUETES ---
+
+# Lista de todos los paquetes necesarios
+packages_needed <- c("readr", "dplyr", "ggplot2", "tidyr", "randomForest", "DBI", "RSQLite", "magrittr")
+
+# Función robusta para instalar y cargar el paquete
+install_if_missing <- function(p) {
+  # Comprueba si el paquete no está instalado
+  if (!require(p, character.only = TRUE)) {
+    message(paste("Instalando el paquete:", p))
+    install.packages(p, dependencies = TRUE)
+  }
+}
+
+# 1.1 Ejecutar la instalación de los paquetes si faltan
+invisible(sapply(packages_needed, install_if_missing))
+
+# 1.2 Cargar todos los paquetes instalados de una sola vez
+message("Cargando todos los paquetes necesarios...")
+invisible(sapply(packages_needed, library, character.only = TRUE))
+
+
+# --- 2. ORQUESTACIÓN DE DATOS (Simulación ETL con RSQLite) ---
+
+# Conexión a una base de datos SQLite en memoria/temporal
+conn <- dbConnect(RSQLite::SQLite(), ":memory:")
+print("Conexión a SQLite en memoria establecida (simulación de servidor de BD).")
+
+# 2.1 Carga del CSV original en R y luego a la base de datos SQLite
+ruta_archivo <- "../Airbnb_Open_Data.csv" 
+# Usamos suppressMessages() para evitar que read_csv muestre demasiados mensajes sobre tipos de columna
+df_raw <- suppressMessages(read_csv(ruta_archivo))
+
+# La tabla CSV original se carga en la tabla 'airbnb_raw' de SQLite
+dbWriteTable(conn, "airbnb_raw", df_raw, overwrite = TRUE)
+print("Datos crudos cargados en la tabla 'airbnb_raw' de SQLite.")
+
+# 2.2 Ejecución del script de limpieza y transformación SQL (01_data_cleaning.sql)
+# El contenido del script SQL se ejecuta directamente sobre la base de datos SQLite.
+dbExecute(conn, "
+    CREATE TABLE airbnb_clean AS
+    SELECT
+        CAST(id AS INTEGER) AS id,
+        NAME AS nombre,
+        CAST(\"host id\" AS INTEGER) AS host_id,
+        \"neighbourhood group\" AS grupo_vecindario,
+        CAST(lat AS REAL) AS latitud,
+        CAST(long AS REAL) AS longitud,
+        \"room type\" AS tipo_habitacion,
+        CAST(\"Construction year\" AS REAL) AS anio_construccion,
+        CAST(REPLACE(REPLACE(price, '$', ''), ',', '') AS REAL) AS precio_noche,
+        CAST(REPLACE(REPLACE(\"service fee\", '$', ''), ',', '') AS REAL) AS tarifa_servicio,
+        CAST(\"minimum nights\" AS REAL) AS minimo_noches,
+        CAST(\"number of reviews\" AS REAL) AS num_reviews,
+        CAST(\"reviews per month\" AS REAL) AS reviews_per_mes,
+        CAST(\"availability 365\" AS REAL) AS disponibilidad_365
+    FROM
+        airbnb_raw
+    WHERE
+        CAST(REPLACE(REPLACE(price, '$', ''), ',', '') AS REAL) > 10 AND
+        CAST(\"minimum nights\" AS REAL) < 366;
+")
+
+print("Fase ETL (SQL) completada. Tabla 'airbnb_clean' creada en SQLite.")
+
+# 2.3 Carga de los datos limpios de la base de datos a R
+query_select_all <- "SELECT * FROM airbnb_clean;"
+df_clean <- dbGetQuery(conn, query_select_all)
+
+# Desconexión de la base de datos
+dbDisconnect(conn)
+print("Desconexión de SQLite. Data Frame limpio cargado en R.")
+
+# --- 3. PREPROCESAMIENTO FINAL EN R (Continuación) ---
+
+# Convertir variables categóricas a factores para el modelo
+df_clean <- df_clean %>%
+  # Reemplazar NAs en 'reviews_per_month' por 0 (si quedaron)
+  replace_na(list(reviews_per_mes = 0)) %>% # NOTA: Corregido nombre de columna de reviews_per_month a reviews_per_mes
+  # Convertir variables categóricas a factores
+  mutate(
+    grupo_vecindario = as.factor(grupo_vecindario),
+    tipo_habitacion = as.factor(tipo_habitacion)
+  )
+
+print("Resumen de las variables clave después de la limpieza:")
+print(summary(df_clean$precio_noche))
+
+# --- 4. ANÁLISIS EXPLORATORIO DE DATOS (EDA) Y VISUALIZACIÓN ---
+
+# A. Distribución del Precio por Grupo de Vecindario (Distrito)
+print("Generando Gráfico: Distribución de Precios por Distrito")
+# 
+ggplot(df_clean, aes(x = grupo_vecindario, y = precio_noche, fill = grupo_vecindario)) +
+  geom_boxplot() +
+  scale_y_log10() + # Usar escala logarítmica para manejar la asimetría del precio
+  labs(
+    title = "Distribución Logarítmica del Precio por Distrito de NYC",
+    x = "Distrito",
+    y = "Precio por Noche (Escala Log)"
+  ) +
+  theme_minimal()
+
+# B. Mapa Geográfico de Precios
+# Se usa un sampleo para acelerar el plot, ya que el dataset es grande
+print("Generando Gráfico: Distribución Geográfica de Listados")
+# 
+df_sample <- sample_n(df_clean, 10000) # Muestra de 10k puntos
+
+ggplot(df_sample, aes(x = longitud, y = latitud, color = precio_noche)) +
+  geom_point(alpha = 0.5) +
+  scale_color_gradient(low = "yellow", high = "red") +
+  labs(
+    title = "Distribución Geográfica y Precio de Airbnb en NYC",
+    x = "Longitud",
+    y = "Latitud",
+    color = "Precio"
+  ) +
+  theme_void()
+
+# --- 5. MODELADO PREDICTIVO (RANDOM FOREST) ---
+
+# Selección de variables para el modelo
+features <- df_clean %>%
+  select(precio_noche, latitud, longitud, tipo_habitacion, grupo_vecindario, minimo_noches, num_reviews)
+
+# Manejo final de NAs (si quedan, se eliminan para el modelo simple)
+features <- na.omit(features)
+
+# División de datos en sets de Entrenamiento (80%) y Prueba (20%)
+set.seed(42) # Para reproducibilidad
+train_index <- sample(nrow(features), 0.8 * nrow(features))
+train_data <- features[train_index, ]
+test_data <- features[-train_index, ]
+
+print("Entrenando el modelo Random Forest para predecir el precio...")
+
+# Entrenamiento del modelo Random Forest
+# Se usa 'ntree=100' y 'mtry=3' por velocidad; en producción se usarían valores mayores
+rf_model <- randomForest(
+  precio_noche ~ latitud + longitud + tipo_habitacion + grupo_vecindario + minimo_noches + num_reviews,
+  data = train_data,
+  ntree = 100,
+  mtry = 3,
+  importance = TRUE
+)
+
+# 6. EVALUACIÓN DEL MODELO
+predictions <- predict(rf_model, test_data)
+
+# Cálculo del RMSE (Root Mean Squared Error)
+rmse <- sqrt(mean((predictions - test_data$precio_noche)^2))
+
+print("--- RESULTADOS DEL MODELO ---")
+cat(sprintf("RMSE (Error Cuadrático Medio) en datos de prueba: $%.2f\n", rmse))
+
+# Visualización de la importancia de las variables
+print("Importancia de las Variables en la Predicción:")
+print(importance(rf_model))
+varImpPlot(rf_model)
